@@ -15,7 +15,7 @@ spec:
         app: worker
     spec:
       containers:
-      - image: {{ $.Values.worker.image.repository }}/{{ $.Values.worker.image.name }}:{{ $.Values.worker.image.tag }}
+      - image: {{ $.Values.worker.image.repository }}/{{ $.Values.worker.image.project }}/{{ $.Values.worker.image.name }}:{{ $.Values.worker.image.tag }}
       #- image: dockersamples/examplevotingapp_worker
         name: worker
         resources:
