@@ -1,0 +1,205 @@
+pipeline {
+  agent {
+    node {
+      label 'maven'
+    }
+  }
+  parameters {
+    string(name: 'GIT_BRANCHES', defaultValue:'sprint_0001', description:'请输入要构建的分支名称')
+    string(name: 'TAG_NAME', defaultValue: '', description: '请输入tag 名称')
+    string(name: 'HELM_GIT_BRANCHES', defaultValue: 'main', description: '请输入要构建的Helm分支名称')
+    booleanParam(name: 'UPDATE_STABLE', defaultValue: false, description: '生成的镜像是否要更新至stable版')
+    booleanParam(name: 'WAIT_FOR_QUALITY_GATE', defaultValue: false, description: '是否等待SonarQube分析完成并返回质量门状态')
+
+  }
+  environment {
+    // 镜像仓库地址
+    REGISTRY_URL          = '192.168.157.4:32380'
+    // harbor 访问凭证
+    REGISTRY_CERT         = ''
+    // harbor 项目
+    HARBOR_PROJECT        = ''
+    // 镜像名称
+    HARBOR_IMAGE_NAME     = ''
+    // 源码地址
+    SOURCE_URL            = 'https://github.com/Yunzan-Hu/example-voting-app.git'
+    // 源码分支版本号
+    SOURCE_REVISION       = 'main'
+    // 源码凭证
+    SOURCE_CERT           = 'gitlab-yunzan'
+    // docker build 的执行上下文
+    DOCKER_CONTEXT        = "."
+    // dockerfile 的文件名与所在位置
+    DOCKERFILE            = "Dockerfile"
+  }
+  stages {
+    stage('Git clone') {
+        steps {
+            container('maven') {
+                script {
+                    // params.GIT_BRANCHES有值时优先，否则取env.SOURCE_REVISION
+                    def branch = params.GIT_BRANCHES ?: env.SOURCE_REVISION
+                    env.TEMP_BRANCH = branch
+                    echo "branch:${branch},env.GIT_BRANCHES${env.GIT_BRANCHES},env.SOURCE_REVISION:${env.SOURCE_REVISION}"
+                    git(url: "${SOURCE_URL}", credentialsId: "${SOURCE_CERT}", branch: "${branch}", changelog: true, poll: false)
+                    if (params.TAG_NAME) {
+                        sh 'git checkout ${TAG_NAME}'
+                    }
+                }
+            }
+        }
+    }
+    stage('Docker Build & Push') {
+        agent none
+        steps {
+            container('maven') {
+                withCredentials([usernamePassword(credentialsId:"${REGISTRY_CERT}", passwordVariable:'password', usernameVariable:'username')]) {
+                    script {
+                        def branch = sh(returnStdout: true, script: 'git rev-parse --abbrev-ref HEAD').trim()
+                        def commit = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+                        def tag = sh(returnStdout: true, script: 'git describe --tags || true').trim()
+                        env.GIT_BRANCH = branch
+                        env.GIT_COMMIT = commit
+                        env.GIT_TAG = tag
+                        def gitLog = sh(returnStdout: true, script: 'git log -1 --pretty=format:"- **%h** | %ad | %s" --date=short ${GIT_TAG}').trim()
+
+                        env.GIT_LOG = gitLog
+                        echo "git info: ${GIT_LOG}"
+                        env.IMG = "${REGISTRY_URL}/${TEMP_HARBOR_PROJECT}/${TEMP_HARBOR_PROJECT_IMAGE_NAME}:${GIT_BRANCH}-${GIT_COMMIT}"
+
+                        if (tag != '') {
+                            env.IMG = "${REGISTRY_URL}/${TEMP_HARBOR_PROJECT}/${TEMP_HARBOR_PROJECT_IMAGE_NAME}:${GIT_TAG}-${GIT_COMMIT}"
+                        }
+                        sh '''
+                        set -ex
+                        sed -i 's?10.95.35.98?harbor.ms5-sit.aswatson.net:8080?g' ${DOCKERFILE}
+                        docker build -f ${DOCKERFILE} ${DOCKER_CONTEXT} -t ${IMG} --tls-verify=false
+                        docker login ${REGISTRY_URL} -u $username -p $password --tls-verify=false
+                        docker push $IMG --tls-verify=false
+                        echo ${IMG} > img
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    stage('Update SIT') {
+      agent none
+      when {
+          expression { return params.TAG_NAME == '' }
+      }
+      steps {
+         container('mavenjdk11') {
+          script {
+              // 替换仓库URL中的'https://'部分
+              def temprepo = "${ARGO_REPO}".replace('https://', '')
+              echo "Modified ARGO_REPO: ${temprepo}"
+
+              // 在工作空间中创建目录并克隆仓库
+              dir("${WORKSPACE}/${env.TEMP_ARGP_REPO_NAME}") {
+                  git(branch: "main", credentialsId: 'gitlab-daocloudadm', url: "${ARGO_REPO}")
+
+                  // 使用yq获取所有版本号，并转换成列表
+                  def versions = sh(
+                      script: 'yq \'.cars.api-aggregator.serviceMesh.versions[].version\' cars/sit/values.yaml',
+                      returnStdout: true
+                  ).trim().split('\n')
+                  def versionExists = versions.contains(env.GIT_BRANCH)
+                  // 遍历所有版本号
+                  if (!versionExists) {
+                      // 如果版本不存在，则追加新版本
+                      sh """
+                          yq -i '.cars.api-aggregator.serviceMesh.versions += [{"version": "${GIT_BRANCH}", "name": "api-aggregator-${GIT_BRANCH}", "image": {"tag": "${GIT_BRANCH}-${GIT_COMMIT}","appVersion": "" }}]' cars/sit/values.yaml
+                      """
+                  } else {
+                      // 如果版本存在，则更新对应版本的 tag
+                      sh """
+                          yq -i ".cars.api-aggregator.serviceMesh.versions[] | select(.version == \\"${GIT_BRANCH}\\").image.tag = \\"${GIT_BRANCH}-${GIT_COMMIT}\\"" cars/sit/values.yaml
+                      """
+                  }
+                  withCredentials([usernamePassword(credentialsId: 'gitlab-daocloudadm', passwordVariable: 'password', usernameVariable: 'username')]) {
+                      sh """
+                          git config user.name "jenkins"
+                          git config user.email "jenkins@jenkins.io"
+                          git add .
+                          git diff --quiet && git diff --staged --quiet ||  git commit -m "[update] [api-aggregator] [imageTag] : ${GIT_BRANCH}-${GIT_COMMIT}"
+                          git push https://${username}:${password}@${temprepo}
+                      """
+                  }
+              }
+          }
+        }
+      }
+    }
+    stage('Update Helm Chart') {
+        when {
+            expression { return params.TAG_NAME != '' }
+        }
+        steps {
+            container('mavenjdk11') {
+                script {
+                    def temprepo = "${CHART_REPO}".replace('https://', '')
+                    echo "Modified helmrepo: ${temprepo}"
+                    dir("${WORKSPACE}/cars-chart") {
+                        // 克隆 Helm Chart 仓库
+                        git(branch: "${HELM_GIT_BRANCHES}", url: "${CHART_REPO}", credentialsId: "${SOURCE_CERT}", changelog: true, poll: true)
+
+                        // 使用 yq 获取所有版本号，并转换成列表
+                        def versions = sh(
+                            script: 'yq eval-all \'.api-aggregator.serviceMesh.versions[].version\' cars/values.yaml',
+                            returnStdout: true
+                        ).trim().split('\n')
+
+                        // 检查版本是否存在
+                        def versionExists = versions.contains(env.GIT_TAG)
+
+                        if (env.UPDATE_STABLE) {
+                            // 如果UPDATE_STABLE = true ,则更新stable 的镜像
+                            sh """
+                                yq eval '.api-aggregator.serviceMesh.versions[] |= select(.version == "stable") * {"image": {"tag": "${GIT_TAG}-${GIT_COMMIT}"}}' -i cars/values.yaml
+                            """
+                        } else if (!versionExists) {
+                            sh """
+                                yq -i '.api-aggregator.serviceMesh.versions += [{"version": "${GIT_TAG}", "name": "api-aggregator-${GIT_TAG}", "image": {"tag": "${GIT_TAG}-${GIT_COMMIT}"},"appVersion": "" }]' cars/values.yaml
+                            """
+                        }
+                        else if (GIT_TAG) {
+                            // 如果版本存在，则更新对应版本的 tag
+                            sh """
+                                yq eval '.api-aggregator.serviceMesh.versions[] |= select(.version == "${GIT_TAG}") * {"image": {"tag": "${GIT_TAG}-${GIT_COMMIT}"}}' -i cars/values.yaml
+                            """
+                        }
+                        def markdown_content = sh(script: '''
+                          curl -s --header "PRIVATE-TOKEN: w_8Zxaw3v8KwaVGNGy8o" "https://daogitlab.aswatson.net/api/v4/projects/112/releases/${GIT_TAG}" | jq -r '.description' | sed '/^$/d'
+                        ''', returnStdout: true).trim()
+
+                        def parsed_content = sh(script: "sh /home/jenkins/parse_commits.sh \"${markdown_content}\"", returnStdout: true).trim()
+                        echo "${parsed_content}"
+                        def commitTitle = "aggregator(DockerImage): api-aggregator:${GIT_TAG}-${GIT_COMMIT}"
+                        writeFile file: 'commit_message.txt', text: "${commitTitle}\n\n${parsed_content}"
+                        withCredentials([usernamePassword(credentialsId: "${SOURCE_CERT}", usernameVariable: 'username', passwordVariable: 'password')]) {
+                          // 提交本地修改
+                        env.TEMPREPO = "${temprepo}"
+
+                         sh '''
+                         git config user.name "jenkins"
+                         git config user.email "jenkins@jenkins.io"
+
+                         # 获取 release description 并直接用作 commit message
+                         git add .
+                         # 检查是否有本地修改
+                         git diff --quiet && git diff --staged --quiet || git commit  -F commit_message.txt
+
+                         # 推送到远程仓库
+                         git push "https://${username}:${password}@${TEMPREPO}"
+                         '''
+                      }
+
+                    }
+                }
+            }
+        }
+    }
+
+  }
+}
