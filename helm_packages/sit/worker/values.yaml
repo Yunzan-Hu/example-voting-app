@@ -8,7 +8,7 @@ worker:
   image:
     name: worker
     repository: "192.168.157.4:32380"
-    tag: sprint_0001-708b82d
+    tag: sprint_0001-4cce598
 
 service:
   type: ClusterIP
